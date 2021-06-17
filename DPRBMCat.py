@@ -5,6 +5,7 @@ from tqdm import tqdm
 import pandas as pd
 import math
 from sklearn.preprocessing import OneHotEncoder
+from tensorflow_privacy.privacy.analysis.compute_dp_sgd_privacy_lib import compute_dp_sgd_privacy
 
 np.random.seed(37)
 
@@ -27,7 +28,7 @@ def get_weight_matrix(n_visible, n_hidden, mean=0.0, stdev=0.1):
     b_h = np.random.normal(loc=mean, scale=stdev, size=n_hidden)
     return W, b_v, b_h
 
-def positive_contrastive_divergence(X, W, b_v, b_h):
+def positive_contrastive_divergence(X, W, b_v, b_h, norm_clip):
     """
     Executes positive contrastive divergence (+CD) phase.
 
@@ -45,7 +46,7 @@ def positive_contrastive_divergence(X, W, b_v, b_h):
     p_associations_b_h = ph_probs.sum(axis=0)
     return ph_states, p_associations_W, p_associations_b_v, p_associations_b_h
 
-def negative_contrastive_divergence(ph_states, W, b_v, b_h, cat):
+def negative_contrastive_divergence(ph_states, W, b_v, b_h, cat, norm_clip):
     """
     Executes negative contrastive divergence (-CD) phase.
 
@@ -66,25 +67,6 @@ def negative_contrastive_divergence(ph_states, W, b_v, b_h, cat):
     n_associations_b_v = nv_states.sum(axis=0)
     n_associations_b_h = nh_probs.sum(axis=0)
     return nv_states, n_associations_W, n_associations_b_v, n_associations_b_h
-
-def update_weights(n, 
-                   p_associations_W, p_associations_b_v, p_associations_b_h, 
-                   n_associations_W, n_associations_b_v, n_associations_b_h, 
-                   W, b_v, b_h, lr=0.1):
-    """
-    Updates the weights after positive and negative associations have been learned.
-
-    :param n: The total number of samples.
-    :param p_associations: Positive associations.
-    :param n_associations: Negative associations.
-    :param W: Weights between connections of visible and hidden layers.
-    :param lr: Learning rate. Default value is 0.1.
-    :return: The adjusted weights.
-    """
-    W_new = W + lr * ((p_associations_W - n_associations_W) / float(n))
-    b_v_new = b_v + lr * ((p_associations_b_v - n_associations_b_v) / float(n))
-    b_h_new = b_h + lr * ((p_associations_b_h - n_associations_b_h) / float(n))
-    return W_new, b_v_new, b_h_new
 
 def sample_hidden(v_mat, W, b_v, b_h):
     h_activations = v_mat.dot(W) + b_h
@@ -125,7 +107,50 @@ def RBM_sample(n_samples, W, b_v, b_h, cat):
     samples = np.vstack(samples)
     return samples
 
-def RBM_train(X, cat, n_hidden = None, max_iters=10, batch_size=64, shuffle=True):
+
+def update_weights_dp(n, 
+                   p_associations_W, p_associations_b_v, p_associations_b_h, 
+                   n_associations_W, n_associations_b_v, n_associations_b_h, 
+                   W, b_v, b_h, lr=0.1, norm_clip=1.0, noise_multiplier=1.0):
+    """
+    Updates the weights after positive and negative associations have been learned.
+
+    :param n: The total number of samples.
+    :param p_associations: Positive associations.
+    :param n_associations: Negative associations.
+    :param W: Weights between connections of visible and hidden layers.
+    :param lr: Learning rate. Default value is 0.1.
+    :return: The adjusted weights.
+    """
+    grad_W = p_associations_W - n_associations_W
+    grad_b_v = p_associations_b_v - n_associations_b_v
+    grad_b_h = p_associations_b_h - n_associations_b_h
+    
+    norm = np.linalg.norm(grad_W, 'fro')**2 + \
+            np.linalg.norm(grad_b_v, 2)**2 + \
+            np.linalg.norm(grad_b_h, 2)**2
+    norm = np.sqrt(norm)
+    print(norm)
+    normalizer = max(1, norm/norm_clip)
+    normalized_grad_W = grad_W / normalizer
+    normalized_grad_b_v = grad_b_v / normalizer
+    normalized_grad_b_h = grad_b_h / normalizer
+    
+    noisy_grad_W = normalized_grad_W + np.random.normal(
+        scale=noise_multiplier * norm_clip, size=normalized_grad_W.shape)
+    noisy_grad_b_v = normalized_grad_b_v + np.random.normal(
+        scale=noise_multiplier * norm_clip, size=normalized_grad_b_v.shape)
+    noisy_grad_b_h = normalized_grad_b_h + np.random.normal(
+        scale=noise_multiplier * norm_clip, size=normalized_grad_b_h.shape)
+    
+    
+    W_new = W + lr * (noisy_grad_W / float(n))
+    b_v_new = b_v + lr * (noisy_grad_b_v / float(n))
+    b_h_new = b_h + lr * (noisy_grad_b_h / float(n))
+    return W_new, b_v_new, b_h_new
+
+def RBM_train_dp(X, cat, target_epsilon, target_delta, norm_clip=1.0, noise_multiplier=1.0,
+                 lr=0.1, n_hidden = None, max_iters=10, batch_size=64, shuffle=True):
     """
     Trains the RBM model.
 
@@ -152,8 +177,13 @@ def RBM_train(X, cat, n_hidden = None, max_iters=10, batch_size=64, shuffle=True
             n_hidden += math.ceil(math.log2(cr-cl))
     W, b_v, b_h = get_weight_matrix(n_visible, n_hidden, mean=0.0, stdev=0.1)
 
+    n = X.shape[0]
     loss_trace = []
     for epoch in tqdm(range(max_iters)):
+        anticipated_epsilon, rdp_order = compute_dp_sgd_privacy(n, batch_size, noise_multiplier, (epoch+1), target_delta)
+        print(f'anticipated epsilon for epoch {epoch} is {anticipated_epsilon} with rdp order {rdp_order}.')
+        if anticipated_epsilon > target_epsilon:
+            break
         S = np.copy(X)
         if shuffle is True:
             np.random.shuffle(S)
@@ -166,10 +196,10 @@ def RBM_train(X, cat, n_hidden = None, max_iters=10, batch_size=64, shuffle=True
                 positive_contrastive_divergence(X_batch, W, b_v, b_h)
             nv_states, n_associations_W, n_associations_b_v, n_associations_b_h = \
                 negative_contrastive_divergence(ph_states, W, b_v, b_h, cat)
-            W, b_v, b_h = update_weights(X.shape[0], \
+            W, b_v, b_h = update_weights_dp(X.shape[0], \
                                          p_associations_W, p_associations_b_v, p_associations_b_h, \
                                          n_associations_W, n_associations_b_v, n_associations_b_h, \
-                                         W, b_v, b_h)
+                                         W, b_v, b_h, lr, norm_clip, noise_multiplier)
             #print(X_batch)
             #print(ph_states)
             #print(nv_states)
@@ -184,7 +214,7 @@ def RBM_train(X, cat, n_hidden = None, max_iters=10, batch_size=64, shuffle=True
             if start >= X.shape[0]:
                 break
         #pbar.close()
-        print(f'Epoch {epoch}, error {error}')
+        print(f'Epoch {epoch}, epsilon {anticipated_epsilon}, error {error}')
 
     loss_df = pd.DataFrame(data=loss_trace, columns=['epoch', 'loss'])
     return W, b_v, b_h, loss_df
@@ -214,7 +244,13 @@ def RBMCat(real_data, metadata):
     X_cat_onehot = enc.fit_transform(X_cat)
     cat = np.r_[0, np.cumsum([len(arr) for arr in enc.categories_])]
     cat = list(zip(cat[:-1], cat[1:]))
-    W, b_v, b_h, loss_df = RBM_train(X_cat_onehot, cat, max_iters=20, batch_size=64)
+    
+    target_epsilon=1.0
+    target_delta=1e-7
+    W, b_v, b_h, loss_df = RBM_train_dp(X_cat_onehot, cat, 
+                                     target_epsilon, target_delta, 
+                                     norm_clip=1.0, noise_multiplier=1.5, 
+                                     lr=0.1, max_iters=20, batch_size=64)
     n_samples = len(df)
     sample = RBM_sample(n_samples, W, b_v, b_h, cat)
     X_cat_inverse = enc.inverse_transform(sample)
